@@ -25,18 +25,29 @@
 #include <linux/init.h> 
 #include <linux/kernel.h>
 #include <linux/platform_device.h>
+#include <linux/workqueue.h>
 #include <mach/panel_id.h> 
 #include "msm_fb.h" 
 #include "mddihost.h" 
 #include "mddihosti.h"
 
-#define write_client_reg(val, reg) mddi_queue_register_write(reg, val, TRUE, 0);
-
 extern int panel_type;
 static DEFINE_MUTEX(panel_lock);
 static struct wake_lock panel_idle_lock;
-static atomic_t bl_ready = ATOMIC_INIT(1);
-static uint8_t last_val = LED_HALF;
+static atomic_t bl_ready = ATOMIC_INIT(0);
+static atomic_t requested_brightness = ATOMIC_INIT(LED_FULL);
+static void lexikon_backlight_work(struct work_struct *work);
+static DECLARE_WORK(backlight_work, lexikon_backlight_work);
+
+static int write_client_reg(unsigned val, unsigned reg)
+{
+    int ret = mddi_queue_register_write(reg, val, TRUE, 0);
+
+    if (ret)
+        pr_err("%s: reg=%#x val=%#x failed (%d)\n",
+            __func__, reg, val, ret);
+    return ret;
+}
 
 // DRIVER_IC_CUT2 = 4
 enum {
@@ -373,7 +384,8 @@ static struct nov_regs uninit_seq[] = {
 
 static int write_seq(struct nov_regs *cmd_table, unsigned array_size)
 {
-    int i;
+    unsigned i;
+    int ret;
 
     for (i = 0; i < array_size; i++)
     {
@@ -382,7 +394,9 @@ static int write_seq(struct nov_regs *cmd_table, unsigned array_size)
             msleep(cmd_table[i].val);
             continue;
         } 
-        write_client_reg(cmd_table[i].val, cmd_table[i].reg);
+        ret = write_client_reg(cmd_table[i].val, cmd_table[i].reg);
+        if (ret)
+            return ret;
 /*
         if (reg == 0x1100)
             mddi_host_reg_out(CMD, MDDI_CMD_POWERDOWN);
@@ -397,55 +411,59 @@ static int lexikon_panel_init(void)
     {
         case PANEL_LEXIKON_SHARP:
         case PANEL_LEXIKON_SHARP_CUT2:
-            write_seq(sharp_init_seq, ARRAY_SIZE(sharp_init_seq));
-            break;
+            return write_seq(sharp_init_seq, ARRAY_SIZE(sharp_init_seq));
         case PANEL_LEXIKON_SONY:
         case PANEL_LEXIKON_SONY_CUT2:
-            write_seq(sony_init_seq, ARRAY_SIZE(sony_init_seq));
-            break;
+            return write_seq(sony_init_seq, ARRAY_SIZE(sony_init_seq));
         default:
             printk(KERN_ERR "%s Unknown panel! \n", __func__);
+            return -ENODEV;
     }
-    return 0;
 }
 
 static int lexikon_panel_uninit(void)
 {
-    write_seq(uninit_seq, ARRAY_SIZE(uninit_seq));
-    return 0;
+    return write_seq(uninit_seq, ARRAY_SIZE(uninit_seq));
 }
 
 static int mddi_lexikon_panel_on(struct platform_device *pdev)
 {
+    int ret;
+
     printk(KERN_DEBUG "[mddi] Turning on\n");
     mutex_lock(&panel_lock);
+    atomic_set(&bl_ready, 0);
     mddi_host_disable_hibernation(true);
     mddi_host_client_cnt_reset();
-    lexikon_panel_init();
-    // mddi is on, start accepting android bl values
-    atomic_set(&bl_ready, 1);
+    ret = lexikon_panel_init();
+    if (!ret)
+        atomic_set(&bl_ready, 1);
     mddi_host_disable_hibernation(false);
     mutex_unlock(&panel_lock);
-    return 0;
+    if (!ret)
+        schedule_work(&backlight_work);
+    return ret;
 }
 
 static int mddi_lexikon_panel_off(struct platform_device *pdev)
 {
+    int ret;
+
     printk(KERN_DEBUG "[mddi] Turning off\n");
     mutex_lock(&panel_lock);
-    mddi_host_disable_hibernation(true);
-    // block all br set requests
     atomic_set(&bl_ready, 0);
-    lexikon_panel_uninit();
+    mddi_host_disable_hibernation(true);
+    ret = lexikon_panel_uninit();
     mddi_host_disable_hibernation(false);
     mutex_unlock(&panel_lock);
-    return 0;
+    return ret;
 }
 
-static unsigned int lexikon_adjust_backlight(enum led_brightness val)
+/* Caller holds panel_lock and the MDP command-block power reference. */
+static int lexikon_adjust_backlight(enum led_brightness val)
 {
-	unsigned int shrink_br;
-	mutex_lock(&panel_lock);
+    unsigned int shrink_br;
+    int ret;
 
     if (val == 0)
         shrink_br = 0;
@@ -460,27 +478,36 @@ static unsigned int lexikon_adjust_backlight(enum led_brightness val)
 
     printk(KERN_DEBUG "[BL] Setting bl to %d\n", shrink_br);    
 
-    write_client_reg(0x00, 0x5500);
-    write_client_reg(shrink_br, 0x5100);
+    ret = write_client_reg(0x00, 0x5500);
+    if (ret)
+        return ret;
+    return write_client_reg(shrink_br, 0x5100);
+}
 
-    last_val = shrink_br;
+static void lexikon_backlight_work(struct work_struct *work)
+{
+    if (!atomic_read(&bl_ready))
+        return;
 
+    wake_lock(&panel_idle_lock);
+    /* Acquire the power vote before panel_lock, matching panel on/off. */
+    mdp_pipe_ctrl(MDP_CMD_BLOCK, MDP_BLOCK_POWER_ON, FALSE);
+    mutex_lock(&panel_lock);
+    if (atomic_read(&bl_ready)) {
+        mddi_host_disable_hibernation(true);
+        lexikon_adjust_backlight(atomic_read(&requested_brightness));
+        mddi_host_disable_hibernation(false);
+    }
     mutex_unlock(&panel_lock);
-    return shrink_br;
+    mdp_pipe_ctrl(MDP_CMD_BLOCK, MDP_BLOCK_POWER_OFF, FALSE);
+    wake_unlock(&panel_idle_lock);
 }
 
 static void lexikon_set_brightness(struct led_classdev *led_cdev,
     enum led_brightness val)
 {
-	if (atomic_read(&bl_ready) == 0) {
-		printk(KERN_DEBUG "[BL] Not ready, val=%d\n", val);
-		return;
-	}
-    // TODO: backlight does not work.  Setting to levels ~76 will cause
-    // device reboot.
-#if 0
-    led_cdev->brightness = lexikon_adjust_backlight(val);
-#endif
+    atomic_set(&requested_brightness, val);
+    schedule_work(&backlight_work);
 }
 
 static struct led_classdev lexikon_backlight_led = {
@@ -496,10 +523,16 @@ static int lexikon_backlight_probe(struct platform_device *pdev)
     rc = led_classdev_register(&pdev->dev, &lexikon_backlight_led);
     if (rc)
     {
-        printk(KERN_ERR "%s +\n", __func__);
-        led_classdev_unregister(&lexikon_backlight_led);
+        pr_err("%s: LED registration failed (%d)\n", __func__, rc);
         return rc;
     }
+    return 0;
+}
+
+static int lexikon_backlight_remove(struct platform_device *pdev)
+{
+    led_classdev_unregister(&lexikon_backlight_led);
+    cancel_work_sync(&backlight_work);
     return 0;
 }
 
@@ -509,6 +542,7 @@ static struct platform_device lexikon_backlight = {
 
 static struct platform_driver lexikon_backlight_driver = {
     .probe      = lexikon_backlight_probe,
+    .remove     = lexikon_backlight_remove,
     .driver     = {
         .name   = "lexikon-backlight",
         .owner  = THIS_MODULE,
